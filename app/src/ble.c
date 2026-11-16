@@ -64,6 +64,63 @@ static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
 static bool directed_advertising_enabled = false;
 
+/* Profiles in CONFIG_ZMK_BLE_ALT_IDENTITY_PROFILES use a second Bluetooth identity. */
+#define ZMK_BLE_ALT_ID_PROFILES CONFIG_ZMK_BLE_ALT_IDENTITY_PROFILES
+
+#if ZMK_BLE_ALT_ID_PROFILES != 0
+BUILD_ASSERT(CONFIG_BT_ID_MAX >= 2,
+             "CONFIG_ZMK_BLE_ALT_IDENTITY_PROFILES requires CONFIG_BT_ID_MAX >= 2");
+
+static uint8_t alt_identity = BT_ID_DEFAULT;
+static bool alt_identity_ready = false;
+
+/* Find or create the second identity. It is created once and then kept in settings by the
+ * Bluetooth host, so its address stays the same across reboots. Does nothing until the default
+ * identity exists (i.e. the Bluetooth stack has finished loading its settings). */
+static void ensure_alt_identity(void) {
+    if (alt_identity_ready) {
+        return;
+    }
+
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = CONFIG_BT_ID_MAX;
+    bt_id_get(addrs, &count);
+
+    if (count == 0) {
+        return;
+    }
+
+    if (count >= 2) {
+        alt_identity = 1;
+        alt_identity_ready = true;
+        return;
+    }
+
+    int id = bt_id_create(NULL, NULL);
+    if (id < 0) {
+        LOG_ERR("Failed to create the second Bluetooth identity (err %d)", id);
+        return;
+    }
+
+    alt_identity = (uint8_t)id;
+    alt_identity_ready = true;
+    LOG_INF("Created Bluetooth identity %d for profiles 0x%x", id, ZMK_BLE_ALT_ID_PROFILES);
+}
+#endif
+
+/* The Bluetooth identity a profile advertises, pairs and connects with. */
+static uint8_t profile_identity(uint8_t index) {
+#if ZMK_BLE_ALT_ID_PROFILES != 0
+    if (index < 32 && (ZMK_BLE_ALT_ID_PROFILES & BIT(index))) {
+        ensure_alt_identity();
+        return alt_identity_ready ? alt_identity : BT_ID_DEFAULT;
+    }
+#endif
+    return BT_ID_DEFAULT;
+}
+
+static uint8_t advertising_identity = BT_ID_DEFAULT;
+
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
@@ -133,7 +190,7 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     bt_addr_le_t *addr = &profiles[index].peer;
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         return false;
-    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
+    } else if ((conn = bt_conn_lookup_addr_le(profile_identity(index), addr)) == NULL) {
         return false;
     }
 
@@ -154,7 +211,7 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
 
 #define CHECKED_DIR_ADV()                                                                          \
     addr = zmk_ble_active_profile_addr();                                                          \
-    conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);                                            \
+    conn = bt_conn_lookup_addr_le(profile_identity(active_profile), addr);                         \
     if (conn != NULL) { /* TODO: Check status of connection */                                     \
         LOG_DBG("Skipping advertising, profile host is already connected");                        \
         bt_conn_unref(conn);                                                                       \
@@ -169,17 +226,21 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     advertising_status = ZMK_ADV_DIR;
 
 #define CHECKED_OPEN_ADV()                                                                         \
-    err = bt_le_adv_start(ZMK_ADV_CONN_NAME, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);         \
+    adv_param = *ZMK_ADV_CONN_NAME;                                                                \
+    adv_param.id = profile_identity(active_profile);                                               \
+    err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                \
     if (err) {                                                                                     \
         LOG_ERR("Advertising failed to start (err %d)", err);                                      \
         return err;                                                                                \
     }                                                                                              \
-    advertising_status = ZMK_ADV_CONN;
+    advertising_status = ZMK_ADV_CONN;                                                             \
+    advertising_identity = adv_param.id;
 
 int update_advertising(void) {
     int err = 0;
     bt_addr_le_t *addr;
     struct bt_conn *conn;
+    struct bt_le_adv_param adv_param;
     enum advertising_type desired_adv = ZMK_ADV_NONE;
 
     if (zmk_ble_active_profile_is_open()) {
@@ -197,6 +258,14 @@ int update_advertising(void) {
         desired_adv = ZMK_ADV_CONN; // TODO: Change back to ZMK_ADV_DIR when fixed
     }
     LOG_DBG("advertising from %d to %d", advertising_status, desired_adv);
+
+    // Already advertising, but with another profile's identity: stop, so it restarts below
+    // with the identity of the active profile.
+    if (desired_adv == ZMK_ADV_CONN && advertising_status == ZMK_ADV_CONN &&
+        advertising_identity != profile_identity(active_profile)) {
+        LOG_DBG("Restarting advertising with identity %d", profile_identity(active_profile));
+        CHECKED_ADV_STOP();
+    }
 
     switch (desired_adv + CURR_ADV(advertising_status)) {
     case ZMK_ADV_NONE + CURR_ADV(ZMK_ADV_DIR):
@@ -229,7 +298,7 @@ K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 
 static void clear_profile_bond(uint8_t profile) {
     if (bt_addr_le_cmp(&profiles[profile].peer, BT_ADDR_LE_ANY)) {
-        bt_unpair(BT_ID_DEFAULT, &profiles[profile].peer);
+        bt_unpair(profile_identity(profile), &profiles[profile].peer);
         set_profile_address(profile, BT_ADDR_LE_ANY);
     }
 }
@@ -329,7 +398,7 @@ int zmk_ble_prof_disconnect(uint8_t index) {
 
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         return -ENODEV;
-    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
+    } else if ((conn = bt_conn_lookup_addr_le(profile_identity(index), addr)) == NULL) {
         return -ENODEV;
     }
 
@@ -349,7 +418,7 @@ struct bt_conn *zmk_ble_active_profile_conn(void) {
     if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
         LOG_WRN("Not sending, no active address for current profile");
         return NULL;
-    } else if ((conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr)) == NULL) {
+    } else if ((conn = bt_conn_lookup_addr_le(profile_identity(active_profile), addr)) == NULL) {
         LOG_WRN("Not sending, not connected to active profile");
         return NULL;
     }
@@ -666,7 +735,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
 
     if (!pairing_allowed_for_current_profile(conn)) {
         LOG_ERR("Pairing completed but current profile is not open: %s", addr);
-        bt_unpair(BT_ID_DEFAULT, dst);
+        bt_unpair(info.id, dst);
         return;
     }
 
@@ -703,7 +772,9 @@ static int zmk_ble_complete_startup(void) {
 #if IS_ENABLED(CONFIG_ZMK_BLE_CLEAR_BONDS_ON_START)
     LOG_WRN("Clearing all existing BLE bond information from the keyboard");
 
-    bt_unpair(BT_ID_DEFAULT, NULL);
+    for (uint8_t id = 0; id < CONFIG_BT_ID_MAX; id++) {
+        bt_unpair(id, NULL);
+    }
 
     for (int i = 0; i < 8; i++) {
         char setting_name[15];

@@ -182,6 +182,27 @@ config ZMK_BLE_PASSKEY_ENTRY
 config BT_SMP_ALLOW_UNAUTH_OVERWRITE
     imply ZMK_BLE_PASSKEY_ENTRY
 
+config ZMK_BLE_ALT_IDENTITY_PROFILES
+    int "Bitmask of BLE profiles that use a second Bluetooth identity"
+    default 0
+    help
+      Profiles whose bit is set advertise, pair and connect using a second
+      Bluetooth identity (a different address). Hosts bonded to one identity
+      do not recognize the other, so a host paired on such a profile only
+      reconnects while that profile is selected, and hosts paired on the other
+      profiles never see it. Example: 2 (binary 010) puts profile 1 on the
+      second identity. Requires BT_ID_MAX >= 2.
+
+config BT_ID_MAX
+    default 2 if ZMK_BLE_ALT_IDENTITY_PROFILES != 0
+
+# With legacy advertising the advertiser, the scanner and the initiator share one random address,
+# and the controller refuses to change it while any of them is active. Advertising with the second
+# identity would then fail while the split central scans for (or connects to) a peripheral.
+# Extended advertising gives the advertising set its own address, so the two do not interfere.
+config BT_EXT_ADV
+    default y if ZMK_BLE_ALT_IDENTITY_PROFILES != 0
+
 config BT_CTLR_PHY_2M
     default n if ZMK_BLE_EXPERIMENTAL_CONN
 
