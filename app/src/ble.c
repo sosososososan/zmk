@@ -610,13 +610,18 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     if (err) {
         LOG_WRN("Failed to connect to %s (%u)", addr, err);
-        update_advertising();
+        k_work_submit(&update_advertising_work);
         return;
     }
 
     LOG_DBG("Connected %s", addr);
 
-    update_advertising();
+    // Restart advertising from a work item, not from here. With extended advertising and more than
+    // one advertising set, Zephyr calls this callback from inside its "advertising set terminated"
+    // handler, which deletes the legacy advertising set when it returns. Starting advertising here
+    // would reuse that set, which then gets deleted while the controller is still advertising with
+    // it; the next host that connects is then dropped ("No valid adv", "Unable to lookup conn").
+    k_work_submit(&update_advertising_work);
 
     if (is_conn_active_profile(conn)) {
         LOG_DBG("Active profile connected");
