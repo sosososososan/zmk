@@ -193,6 +193,23 @@ config ZMK_BLE_ALT_IDENTITY_PROFILES
       profiles never see it. Example: 2 (binary 010) puts profile 1 on the
       second identity. Requires BT_ID_MAX >= 2.
 
+config ZMK_BLE_FAST_ADV_TIMEOUT
+    int "Seconds to advertise with a short interval after advertising starts"
+    default 0
+    help
+      When advertising starts (at boot, after selecting a profile, or after a host connects or
+      disconnects), advertise with ZMK_BLE_FAST_ADV_INT_MIN/MAX for this many seconds, then go on
+      with the normal interval (100-150 ms). Hosts that scan only rarely in the background
+      (Windows, some USB Bluetooth adapters) then find the keyboard much sooner. 0 disables it.
+
+config ZMK_BLE_FAST_ADV_INT_MIN
+    int "Minimum fast advertising interval (units of 0.625 ms)"
+    default 32
+
+config ZMK_BLE_FAST_ADV_INT_MAX
+    int "Maximum fast advertising interval (units of 0.625 ms)"
+    default 48
+
 config BT_ID_MAX
     default 2 if ZMK_BLE_ALT_IDENTITY_PROFILES != 0
 

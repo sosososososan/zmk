@@ -231,6 +231,11 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
 #define CHECKED_OPEN_ADV()                                                                         \
     adv_param = *ZMK_ADV_CONN_NAME;                                                                \
     adv_param.id = profile_identity(active_profile);                                               \
+    fast_adv = FAST_ADV_ENABLED && !fast_adv_expired;                                             \
+    if (fast_adv) {                                                                                \
+        adv_param.interval_min = CONFIG_ZMK_BLE_FAST_ADV_INT_MIN;                                  \
+        adv_param.interval_max = CONFIG_ZMK_BLE_FAST_ADV_INT_MAX;                                  \
+    }                                                                                              \
     err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                \
     if (err == -EALREADY) {                                                                        \
         /* With extended advertising the set is only marked stopped when the controller reports  \
@@ -244,16 +249,31 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
         return err;                                                                                \
     }                                                                                              \
     advertising_status = ZMK_ADV_CONN;                                                             \
-    advertising_identity = adv_param.id;
+    advertising_identity = adv_param.id;                                                           \
+    advertising_fast = fast_adv;                                                                   \
+    if (fast_adv) {                                                                                \
+        k_work_reschedule(&fast_adv_timeout_work, K_SECONDS(CONFIG_ZMK_BLE_FAST_ADV_TIMEOUT));     \
+    }
 
 static void update_advertising_callback(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(update_advertising_retry_work, update_advertising_callback);
+
+#define FAST_ADV_ENABLED (CONFIG_ZMK_BLE_FAST_ADV_TIMEOUT > 0)
+
+// Whether the current connectable advertising uses the fast interval.
+static bool advertising_fast = false;
+// Set only while fast_adv_timeout() restarts advertising, so that restart uses the normal interval.
+static bool fast_adv_expired = false;
+
+static void fast_adv_timeout(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(fast_adv_timeout_work, fast_adv_timeout);
 
 int update_advertising(void) {
     int err = 0;
     bt_addr_le_t *addr;
     struct bt_conn *conn;
     struct bt_le_adv_param adv_param;
+    bool fast_adv;
     enum advertising_type desired_adv = ZMK_ADV_NONE;
 
     if (zmk_ble_active_profile_is_open()) {
@@ -306,6 +326,25 @@ int update_advertising(void) {
 };
 
 static void update_advertising_callback(struct k_work *work) { update_advertising(); }
+
+// Fast advertising ran for CONFIG_ZMK_BLE_FAST_ADV_TIMEOUT seconds without a host connecting:
+// go on advertising with the normal interval to save power.
+static void fast_adv_timeout(struct k_work *work) {
+    if (advertising_status != ZMK_ADV_CONN || !advertising_fast) {
+        return;
+    }
+
+    LOG_DBG("Fast advertising timed out, continuing with the normal interval");
+    int err = bt_le_adv_stop();
+    advertising_status = ZMK_ADV_NONE;
+    if (err) {
+        LOG_ERR("Failed to stop fast advertising (err %d)", err);
+    }
+
+    fast_adv_expired = true;
+    update_advertising();
+    fast_adv_expired = false;
+}
 
 K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 
