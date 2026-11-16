@@ -113,7 +113,10 @@ static uint8_t profile_identity(uint8_t index) {
 #if ZMK_BLE_ALT_ID_PROFILES != 0
     if (index < 32 && (ZMK_BLE_ALT_ID_PROFILES & BIT(index))) {
         ensure_alt_identity();
-        return alt_identity_ready ? alt_identity : BT_ID_DEFAULT;
+        // If the second identity could not be created yet, return an identity that does not exist
+        // (advertising then fails) rather than identity 0, so this profile never bonds on the
+        // wrong identity.
+        return alt_identity_ready ? alt_identity : 1;
     }
 #endif
     return BT_ID_DEFAULT;
@@ -229,12 +232,22 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     adv_param = *ZMK_ADV_CONN_NAME;                                                                \
     adv_param.id = profile_identity(active_profile);                                               \
     err = bt_le_adv_start(&adv_param, zmk_ble_ad, ARRAY_SIZE(zmk_ble_ad), NULL, 0);                \
+    if (err == -EALREADY) {                                                                        \
+        /* With extended advertising the set is only marked stopped when the controller reports  \
+         * it terminated, which can come after the connected callback. Try again shortly. */      \
+        LOG_DBG("Advertising set still active, retrying");                                         \
+        k_work_reschedule(&update_advertising_retry_work, K_MSEC(50));                             \
+        return 0;                                                                                  \
+    }                                                                                              \
     if (err) {                                                                                     \
         LOG_ERR("Advertising failed to start (err %d)", err);                                      \
         return err;                                                                                \
     }                                                                                              \
     advertising_status = ZMK_ADV_CONN;                                                             \
     advertising_identity = adv_param.id;
+
+static void update_advertising_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(update_advertising_retry_work, update_advertising_callback);
 
 int update_advertising(void) {
     int err = 0;
@@ -299,6 +312,11 @@ K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 static void clear_profile_bond(uint8_t profile) {
     if (bt_addr_le_cmp(&profiles[profile].peer, BT_ADDR_LE_ANY)) {
         bt_unpair(profile_identity(profile), &profiles[profile].peer);
+        if (profile_identity(profile) != BT_ID_DEFAULT) {
+            // The host may still have a bond on identity 0 from before this profile used the
+            // second identity. Remove it too (an error just means there was none).
+            bt_unpair(BT_ID_DEFAULT, &profiles[profile].peer);
+        }
         set_profile_address(profile, BT_ADDR_LE_ANY);
     }
 }
